@@ -58,26 +58,38 @@ def get_random_headers():
     return headers
 
 def load_cookies():
-    """Load cookies from Netscape format file"""
-    cookies_dict = {}
-    if os.path.exists(COOKIES_FILE):
-        try:
-            with open(COOKIES_FILE, 'r', encoding='utf-8') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith('#'):
-                        continue
-                    parts = line.split('\t')
-                    if len(parts) >= 7:
-                        name = parts[5]
-                        value = parts[6]
-                        cookies_dict[name] = value
-            logger.info(f"Loaded {len(cookies_dict)} cookies")
-        except Exception as e:
-            logger.error(f"Error loading cookies: {str(e)}")
-    else:
-        logger.warning(f"Cookies file {COOKIES_FILE} not found")
+    """Load hardcoded cookies - Replace with your actual TeraBox cookies"""
+    cookies_dict = {
+        # Authentication cookies
+        'BDUSS': 'YOUR_BDUSS_TOKEN_HERE',
+        'BDUSS_BFESS': 'YOUR_BDUSS_BFESS_TOKEN_HERE',
+        'STOKEN': 'YOUR_STOKEN_HERE',
+        'PTOKEN': 'YOUR_PTOKEN_HERE',
+        
+        # Session cookies
+        'ndus': 'YOUR_NDUS_HERE',
+        'ndut_fmt': 'YOUR_NDUT_FMT_HERE',
+        'csrfToken': 'YOUR_CSRF_TOKEN_HERE',
+        
+        # Additional cookies (add more as needed)
+        'lang': 'en',
+        'PANWEB': '1',
+        '__duoduo_device_id__': 'YOUR_DEVICE_ID_HERE',
+        
+        # Example of actual cookie values format:
+        # 'BDUSS': 'ABC123XYZ789...your-actual-bduss-token-here...==',
+        # 'STOKEN': 'def456uvw012...your-actual-stoken-here...',
+        # 'csrfToken': 'ghi789rst345...your-csrf-token-here...',
+    }
     
+    # Remove empty values
+    cookies_dict = {k: v for k, v in cookies_dict.items() if v and not v.startswith('YOUR_')}
+    
+    if not cookies_dict:
+        logger.warning("No valid cookies found. Please replace placeholder values with actual TeraBox cookies.")
+        return {}
+    
+    logger.info(f"Loaded {len(cookies_dict)} hardcoded cookies")
     return cookies_dict
 
 def find_between(string, start, end):
@@ -165,9 +177,43 @@ def make_request(url, method='GET', headers=None, params=None, cookies=None, all
     
     raise Exception(f"Max retries exceeded. Last error: {str(last_exception)}")
 
+def get_hardcoded_tokens():
+    """Get hardcoded tokens - Replace with your actual TeraBox tokens"""
+    tokens = {
+        # Extract these from TeraBox page source or network requests
+        'js_token': 'YOUR_JS_TOKEN_HERE',  # Example: 'abcd1234efgh5678ijkl9012mnop3456'
+        'log_id': 'YOUR_LOG_ID_HERE',     # Example: '123456789012345678'
+        
+        # You can also add backup tokens
+        'backup_js_token': 'YOUR_BACKUP_JS_TOKEN_HERE',
+        'backup_log_id': 'YOUR_BACKUP_LOG_ID_HERE',
+    }
+    
+    # Remove placeholder values
+    valid_tokens = {}
+    for key, value in tokens.items():
+        if value and not value.startswith('YOUR_'):
+            valid_tokens[key] = value
+    
+    return valid_tokens
 def extract_tokens_from_html(html_content):
     """Extract tokens from HTML using multiple methods"""
     tokens = {}
+    
+    # First try to use hardcoded tokens
+    hardcoded_tokens = get_hardcoded_tokens()
+    if hardcoded_tokens.get('js_token'):
+        tokens['js_token'] = hardcoded_tokens['js_token']
+    if hardcoded_tokens.get('log_id'):
+        tokens['log_id'] = hardcoded_tokens['log_id']
+    
+    # If hardcoded tokens are available, return them
+    if tokens.get('js_token') and tokens.get('log_id'):
+        logger.info("Using hardcoded tokens")
+        return tokens
+    
+    # Fallback to extracting from HTML if hardcoded tokens are not available
+    logger.info("Hardcoded tokens not found, extracting from HTML...")
     
     # Method 1: Extract jsToken
     js_token_patterns = [
@@ -177,11 +223,12 @@ def extract_tokens_from_html(html_content):
         r'jsToken["\']?\s*[:=]\s*["\']([^"\']+)["\']'
     ]
     
-    for pattern in js_token_patterns:
-        match = re.search(pattern, html_content)
-        if match:
-            tokens['js_token'] = unquote(match.group(1))
-            break
+    if not tokens.get('js_token'):
+        for pattern in js_token_patterns:
+            match = re.search(pattern, html_content)
+            if match:
+                tokens['js_token'] = unquote(match.group(1))
+                break
     
     # Method 2: Extract logid
     logid_patterns = [
@@ -191,11 +238,21 @@ def extract_tokens_from_html(html_content):
         r'logid["\']?\s*[:=]\s*["\']([^"\']+)["\']'
     ]
     
-    for pattern in logid_patterns:
-        match = re.search(pattern, html_content)
-        if match:
-            tokens['log_id'] = match.group(1)
-            break
+    if not tokens.get('log_id'):
+        for pattern in logid_patterns:
+            match = re.search(pattern, html_content)
+            if match:
+                tokens['log_id'] = match.group(1)
+                break
+    
+    # Try backup tokens if primary extraction failed
+    if not tokens.get('js_token') and hardcoded_tokens.get('backup_js_token'):
+        tokens['js_token'] = hardcoded_tokens['backup_js_token']
+        logger.info("Using backup jsToken")
+    
+    if not tokens.get('log_id') and hardcoded_tokens.get('backup_log_id'):
+        tokens['log_id'] = hardcoded_tokens['backup_log_id']
+        logger.info("Using backup logid")
     
     return tokens
 
@@ -220,7 +277,8 @@ def fetch_download_links(url):
     try:
         cookies = load_cookies()
         if not cookies:
-            raise Exception("No cookies found. Please provide valid cookies in cookies.txt file.")
+            logger.warning("No cookies loaded, but continuing with token-based authentication")
+            cookies = {}
         
         logger.info(f"Processing URL: {url}")
         
@@ -631,13 +689,6 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 if __name__ == '__main__':
-    # Ensure cookies file exists
-    if not os.path.exists(COOKIES_FILE):
-        logger.warning(f"Creating empty cookies file: {COOKIES_FILE}")
-        with open(COOKIES_FILE, 'w') as f:
-            f.write("# Netscape HTTP Cookie File\n")
-            f.write("# Place your TeraBox cookies here\n")
-    
     port = int(os.environ.get("PORT", PORT))
     logger.info(f"Starting TeraBox API server on port {port}")
     logger.info(f"Cookies loaded: {len(load_cookies())}")
