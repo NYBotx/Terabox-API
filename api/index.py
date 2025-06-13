@@ -1,13 +1,12 @@
 import os
 from flask import Flask, request, jsonify, Response
 import json
-import aiohttp
-import asyncio
+import requests
 import logging
 import random
 import time
-from urllib.parse import parse_qs, urlparse
-from fake_useragent import UserAgent
+from urllib.parse import parse_qs, urlparse, unquote
+import re
 from concurrent.futures import ThreadPoolExecutor
 import threading
 
@@ -27,18 +26,24 @@ PORT = 3000
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize user agent rotator
-ua = UserAgent()
+# Thread pool for operations
+executor = ThreadPoolExecutor(max_workers=5)
 
-# Thread pool for async operations
-executor = ThreadPoolExecutor(max_workers=10)
+# User agents list
+USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.107 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:90.0) Gecko/20100101 Firefox/90.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+]
 
 def get_random_headers():
     """Generate random headers for requests"""
     headers = {
-        'User-Agent': ua.random,
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
+        'User-Agent': random.choice(USER_AGENTS),
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
         'Accept-Encoding': 'gzip, deflate, br',
         'Connection': 'keep-alive',
         'Upgrade-Insecure-Requests': '1',
@@ -46,8 +51,9 @@ def get_random_headers():
         'Sec-Fetch-Mode': 'navigate',
         'Sec-Fetch-Site': 'none',
         'Sec-Fetch-User': '?1',
-        'Cache-Control': 'max-age=0',
-        'Referer': 'https://terafileshare.com/'
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+        'DNT': '1'
     }
     return headers
 
@@ -56,17 +62,17 @@ def load_cookies():
     cookies_dict = {}
     if os.path.exists(COOKIES_FILE):
         try:
-            with open(COOKIES_FILE, 'r') as f:
+            with open(COOKIES_FILE, 'r', encoding='utf-8') as f:
                 for line in f:
                     line = line.strip()
                     if not line or line.startswith('#'):
                         continue
                     parts = line.split('\t')
                     if len(parts) >= 7:
-                        # Netscape format: domain, flag, path, secure, expiration, name, value
                         name = parts[5]
                         value = parts[6]
                         cookies_dict[name] = value
+            logger.info(f"Loaded {len(cookies_dict)} cookies")
         except Exception as e:
             logger.error(f"Error loading cookies: {str(e)}")
     else:
@@ -88,221 +94,293 @@ def find_between(string, start, end):
     except Exception:
         return None
 
-async def make_request(session, url, method='GET', headers=None, params=None, allow_redirects=True):
-    """Make HTTP request with retry logic"""
+def make_request(url, method='GET', headers=None, params=None, cookies=None, allow_redirects=True, timeout=None):
+    """Make HTTP request with retry logic using requests library"""
+    session = requests.Session()
+    
+    # Set cookies
+    if cookies:
+        session.cookies.update(cookies)
+    
+    # Set headers
+    if headers:
+        session.headers.update(headers)
+    else:
+        session.headers.update(get_random_headers())
+    
     retry_count = 0
     last_exception = None
     
     while retry_count < MAX_RETRIES:
         try:
-            current_headers = headers or get_random_headers()
-            
             # Add random delay to avoid rate limiting
             if retry_count > 0:
-                await asyncio.sleep(random.uniform(1, 3))
+                time.sleep(random.uniform(2, 5))
             
-            async with session.request(
-                method,
-                url,
-                headers=current_headers,
+            response = session.request(
+                method=method,
+                url=url,
                 params=params,
-                allow_redirects=allow_redirects
-            ) as response:
-                if response.status == 403:
-                    logger.warning(f"Blocked by server (403), retrying... (attempt {retry_count + 1})")
-                    retry_count += 1
-                    await asyncio.sleep(RETRY_DELAY * (retry_count + 1))
-                    continue
-                elif response.status == 429:
-                    logger.warning(f"Rate limited (429), retrying... (attempt {retry_count + 1})")
-                    retry_count += 1
-                    await asyncio.sleep(RETRY_DELAY * (retry_count + 2))
-                    continue
-                
-                response.raise_for_status()
-                return response
-                
-        except aiohttp.ClientConnectionError as e:
+                allow_redirects=allow_redirects,
+                timeout=timeout or REQUEST_TIMEOUT,
+                verify=False  # Disable SSL verification
+            )
+            
+            if response.status_code == 403:
+                logger.warning(f"Blocked by server (403), retrying... (attempt {retry_count + 1})")
+                retry_count += 1
+                time.sleep(RETRY_DELAY * (retry_count + 2))
+                continue
+            elif response.status_code == 429:
+                logger.warning(f"Rate limited (429), retrying... (attempt {retry_count + 1})")
+                retry_count += 1
+                time.sleep(RETRY_DELAY * (retry_count + 3))
+                continue
+            elif response.status_code >= 500:
+                logger.warning(f"Server error ({response.status_code}), retrying... (attempt {retry_count + 1})")
+                retry_count += 1
+                time.sleep(RETRY_DELAY * (retry_count + 1))
+                continue
+            
+            response.raise_for_status()
+            return response
+            
+        except requests.exceptions.ConnectionError as e:
             logger.warning(f"Connection error: {str(e)}, retrying... (attempt {retry_count + 1})")
             retry_count += 1
             last_exception = e
-            await asyncio.sleep(RETRY_DELAY * (retry_count + 1))
-        except asyncio.TimeoutError as e:
+            time.sleep(RETRY_DELAY * (retry_count + 2))
+        except requests.exceptions.Timeout as e:
             logger.warning(f"Request timeout, retrying... (attempt {retry_count + 1})")
             retry_count += 1
             last_exception = e
-            await asyncio.sleep(RETRY_DELAY * (retry_count + 1))
+            time.sleep(RETRY_DELAY * (retry_count + 1))
         except Exception as e:
             logger.warning(f"Request failed: {str(e)}, retrying... (attempt {retry_count + 1})")
             retry_count += 1
             last_exception = e
-            await asyncio.sleep(RETRY_DELAY * (retry_count + 1))
+            time.sleep(RETRY_DELAY * (retry_count + 1))
+        finally:
+            session.close()
     
     raise Exception(f"Max retries exceeded. Last error: {str(last_exception)}")
 
-async def fetch_download_link_async(url):
+def extract_tokens_from_html(html_content):
+    """Extract tokens from HTML using multiple methods"""
+    tokens = {}
+    
+    # Method 1: Extract jsToken
+    js_token_patterns = [
+        r'fn%28%22([^%]+)%22%29',
+        r'"jsToken":"([^"]+)"',
+        r'jsToken%22%3A%22([^%]+)%22',
+        r'jsToken["\']?\s*[:=]\s*["\']([^"\']+)["\']'
+    ]
+    
+    for pattern in js_token_patterns:
+        match = re.search(pattern, html_content)
+        if match:
+            tokens['js_token'] = unquote(match.group(1))
+            break
+    
+    # Method 2: Extract logid
+    logid_patterns = [
+        r'dp-logid=([^&]+)',
+        r'"logid":"([^"]+)"',
+        r'dplogid":"([^"]+)"',
+        r'logid["\']?\s*[:=]\s*["\']([^"\']+)["\']'
+    ]
+    
+    for pattern in logid_patterns:
+        match = re.search(pattern, html_content)
+        if match:
+            tokens['log_id'] = match.group(1)
+            break
+    
+    return tokens
+
+def extract_surl_from_url(url):
+    """Extract surl from TeraBox URL"""
+    # Method 1: From query parameter
+    if 'surl=' in url:
+        return url.split('surl=')[1].split('&')[0]
+    
+    # Method 2: From path
+    if '/s/' in url:
+        return url.split('/s/')[1].split('?')[0].split('/')[0]
+    
+    # Method 3: From hash
+    if '#' in url and 'surl=' in url:
+        return url.split('surl=')[1].split('&')[0]
+    
+    return None
+
+def fetch_download_links(url):
     """Fetch download links from TeraBox URL"""
     try:
         cookies = load_cookies()
         if not cookies:
             raise Exception("No cookies found. Please provide valid cookies in cookies.txt file.")
         
-        # Create cookie jar from loaded cookies
-        cookie_jar = aiohttp.CookieJar()
-        for name, value in cookies.items():
-            cookie_jar.update_cookies({name: value})
+        logger.info(f"Processing URL: {url}")
+        
+        # Step 1: Get initial page
+        headers = get_random_headers()
+        headers['Referer'] = 'https://www.terabox.com/'
+        
+        response = make_request(url, headers=headers, cookies=cookies)
+        html_content = response.text
+        final_url = response.url
+        
+        logger.info(f"Got response from: {final_url}")
+        
+        # Step 2: Extract tokens
+        tokens = extract_tokens_from_html(html_content)
+        
+        if not tokens.get('js_token'):
+            logger.error("Could not extract jsToken")
+            raise Exception("Could not extract required jsToken from the page")
+        
+        if not tokens.get('log_id'):
+            logger.error("Could not extract logid")
+            raise Exception("Could not extract required logid from the page")
+        
+        logger.info(f"Extracted tokens - jsToken: {tokens['js_token'][:10]}..., logid: {tokens['log_id']}")
+        
+        # Step 3: Extract surl
+        surl = extract_surl_from_url(final_url) or extract_surl_from_url(url)
+        
+        if not surl:
+            logger.error(f"Could not extract surl from URL: {final_url}")
+            raise Exception("Could not extract surl from URL")
+        
+        logger.info(f"Extracted surl: {surl}")
+        
+        # Step 4: Prepare API parameters
+        params = {
+            'app_id': '250528',
+            'web': '1',
+            'channel': 'dubox',
+            'clienttype': '0',
+            'jsToken': tokens['js_token'],
+            'dplogid': tokens['log_id'],
+            'page': '1',
+            'num': '20',
+            'order': 'time',
+            'desc': '1',
+            'site_referer': final_url,
+            'shorturl': surl,
+            'root': '1'
+        }
+        
+        # Step 5: Make API request
+        api_endpoints = [
+            'https://www.terabox.com/share/list',
+            'https://terabox.com/share/list',
+            'https://www.1024tera.com/share/list'
+        ]
+        
+        list_data = None
+        for endpoint in api_endpoints:
+            try:
+                logger.info(f"Trying API endpoint: {endpoint}")
+                
+                api_headers = get_random_headers()
+                api_headers.update({
+                    'Referer': final_url,
+                    'X-Requested-With': 'XMLHttpRequest',
+                    'Accept': 'application/json, text/plain, */*'
+                })
+                
+                # Add delay before API call
+                time.sleep(random.uniform(1, 3))
+                
+                response = make_request(
+                    endpoint,
+                    params=params,
+                    headers=api_headers,
+                    cookies=cookies,
+                    timeout=30
+                )
+                
+                list_data = response.json()
+                
+                if 'list' in list_data and list_data['list']:
+                    logger.info(f"Successfully got data from {endpoint}")
+                    break
+                else:
+                    logger.warning(f"No data in response from {endpoint}")
+                    
+            except Exception as e:
+                logger.warning(f"Failed to get data from {endpoint}: {str(e)}")
+                continue
+        
+        if not list_data or 'list' not in list_data or not list_data['list']:
+            raise Exception("No files found in the shared link")
+        
+        logger.info(f"Found {len(list_data['list'])} items")
+        
+        # Step 6: Handle directories
+        files = list_data['list']
+        if files[0].get('isdir') == 1 or files[0].get('isdir') == "1":
+            logger.info("First item is a directory, fetching directory contents")
             
-        # Configure connector with proper settings
-        connector = aiohttp.TCPConnector(
-            limit=50,
-            limit_per_host=10,
-            keepalive_timeout=30,
-            enable_cleanup_closed=True,
-            force_close=False,
-            ssl=False
-        )
+            dir_params = params.copy()
+            dir_params.update({
+                'dir': files[0]['path'],
+                'order': 'name',
+                'desc': '0'
+            })
+            dir_params.pop('root', None)
             
-        # Configure timeout
-        timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT, connect=10)
-            
-        async with aiohttp.ClientSession(
-            cookie_jar=cookie_jar,
-            connector=connector,
-            timeout=timeout,
-            headers=get_random_headers()
-        ) as session:
-            
-            # First request to get the initial page
-            logger.info(f"Making initial request to: {url}")
-            response = await make_request(session, url)
-            response_data = await response.text()
-            
-            # Extract tokens with multiple fallback methods
-            js_token = (
-                find_between(response_data, 'fn%28%22', '%22%29') or
-                find_between(response_data, 'jsToken":"', '"') or
-                find_between(response_data, 'jsToken%22%3A%22', '%22')
-            )
-            
-            log_id = (
-                find_between(response_data, 'dp-logid=', '&') or
-                find_between(response_data, 'logid":"', '"') or
-                find_between(response_data, 'dplogid":"', '"')
-            )
-            
-            if not js_token:
-                logger.error("Could not extract js_token from response")
-                raise Exception("Could not extract required jsToken from the page")
-            
-            if not log_id:
-                logger.error("Could not extract log_id from response")
-                raise Exception("Could not extract required logid from the page")
-            
-            logger.info(f"Extracted tokens - jsToken: {js_token[:10]}..., logid: {log_id}")
-            
-            # Parse surl from final URL (after redirects)
-            request_url = str(response.url)
-            surl = None
-            
-            # Try multiple methods to extract surl
-            if 'surl=' in request_url:
-                surl = request_url.split('surl=')[1].split('&')[0]
-            elif '/s/' in request_url:
-                surl = request_url.split('/s/')[1].split('?')[0]
-            
-            if not surl:
-                logger.error(f"Could not extract surl from URL: {request_url}")
-                raise Exception("Could not extract surl from URL")
-            
-            logger.info(f"Extracted surl: {surl}")
-            
-            # Prepare API parameters
-            params = {
-                'app_id': '250528',
-                'web': '1',
-                'channel': 'dubox',
-                'clienttype': '0',
-                'jsToken': js_token,
-                'dplogid': log_id,
-                'page': '1',
-                'num': '20',
-                'order': 'time',
-                'desc': '1',
-                'site_referer': request_url,
-                'shorturl': surl,
-                'root': '1'
-            }
-            
-            # Try multiple API endpoints
-            api_endpoints = [
-                'https://www.1024tera.com/share/list',
-                'https://www.terabox.com/share/list',
-                'https://terabox.com/share/list'
-            ]
-            
-            list_data = None
             for endpoint in api_endpoints:
                 try:
-                    logger.info(f"Trying API endpoint: {endpoint}")
-                    list_response = await make_request(session, endpoint, params=params)
-                    list_data = await list_response.json()
-                    if 'list' in list_data and list_data['list']:
-                        logger.info(f"Successfully got data from {endpoint}")
+                    time.sleep(random.uniform(1, 2))
+                    
+                    response = make_request(
+                        endpoint,
+                        params=dir_params,
+                        headers=api_headers,
+                        cookies=cookies,
+                        timeout=30
+                    )
+                    
+                    dir_data = response.json()
+                    if 'list' in dir_data and dir_data['list']:
+                        logger.info(f"Successfully got directory data from {endpoint}")
+                        files = dir_data['list']
                         break
                 except Exception as e:
-                    logger.warning(f"Failed to get data from {endpoint}: {str(e)}")
+                    logger.warning(f"Failed to get directory data from {endpoint}: {str(e)}")
                     continue
-            
-            if not list_data or 'list' not in list_data or not list_data['list']:
-                raise Exception("No files found in the shared link")
-            
-            logger.info(f"Found {len(list_data['list'])} items")
-            
-            # Handle directories
-            if list_data['list'][0].get('isdir') == 1 or list_data['list'][0].get('isdir') == "1":
-                logger.info("First item is a directory, fetching directory contents")
-                dir_params = params.copy()
-                dir_params.update({
-                    'dir': list_data['list'][0]['path'],
-                    'order': 'name',
-                    'desc': '0'
-                })
-                dir_params.pop('root', None)
-                
-                for endpoint in api_endpoints:
-                    try:
-                        dir_response = await make_request(session, endpoint, params=dir_params)
-                        dir_data = await dir_response.json()
-                        if 'list' in dir_data and dir_data['list']:
-                            logger.info(f"Successfully got directory data from {endpoint}")
-                            return dir_data['list']
-                    except Exception as e:
-                        logger.warning(f"Failed to get directory data from {endpoint}: {str(e)}")
-                        continue
-                
+            else:
                 raise Exception("No files found in the directory")
-            
-            return list_data['list']
-    
+        
+        return files
+        
     except Exception as e:
-        logger.error(f"Error in fetch_download_link_async: {str(e)}")
+        logger.error(f"Error in fetch_download_links: {str(e)}")
         raise
 
-async def get_direct_link(session, dlink):
-    """Get direct download link by following redirects"""
+def get_direct_link(dlink, cookies):
+    """Get direct download link"""
     try:
         if not dlink:
             return ""
-            
-        # Add random delay
-        await asyncio.sleep(random.uniform(0.2, 0.8))
         
-        # Make a simple GET request without following redirects
-        async with session.get(dlink, allow_redirects=False) as response:
-            if 300 <= response.status < 400 and 'Location' in response.headers:
-                return response.headers['Location']
-            elif response.status == 200:
-                return dlink
+        headers = get_random_headers()
+        headers['Referer'] = 'https://www.terabox.com/'
+        
+        response = make_request(
+            dlink,
+            headers=headers,
+            cookies=cookies,
+            allow_redirects=False,
+            timeout=15
+        )
+        
+        if 300 <= response.status_code < 400 and 'Location' in response.headers:
+            return response.headers['Location']
         
         return dlink
         
@@ -324,36 +402,41 @@ def format_size(size_bytes):
     except Exception:
         return "Unknown size"
 
-async def process_file(session, file_data):
-    """Process individual file data"""
-    try:
-        # Get direct link
-        direct_link = await get_direct_link(session, file_data.get('dlink', ''))
-        
-        return {
-            "file_name": file_data.get("server_filename", "Unknown"),
-            "size": format_size(file_data.get("size", 0)),
-            "size_bytes": int(file_data.get("size", 0)),
-            "download_url": file_data.get('dlink', ''),
-            "direct_download_url": direct_link,
-            "is_directory": file_data.get("isdir", 0) == 1 or file_data.get("isdir", "0") == "1",
-            "modify_time": file_data.get("server_mtime", 0),
-            "thumbnails": file_data.get("thumbs", {}),
-            "path": file_data.get("path", ""),
-            "category": file_data.get("category", 0)
-        }
-    except Exception as e:
-        logger.error(f"Error processing file: {str(e)}")
-        return None
-
-def run_async_function(func, *args):
-    """Run async function in thread pool"""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        return loop.run_until_complete(func(*args))
-    finally:
-        loop.close()
+def process_files(files, cookies):
+    """Process file list and get download links"""
+    results = []
+    
+    for i, file_data in enumerate(files[:5]):  # Limit to 5 files
+        try:
+            logger.info(f"Processing file {i+1}/{min(len(files), 5)}: {file_data.get('server_filename', 'Unknown')}")
+            
+            # Get direct link
+            direct_link = get_direct_link(file_data.get('dlink', ''), cookies)
+            
+            result = {
+                "file_name": file_data.get("server_filename", "Unknown"),
+                "size": format_size(file_data.get("size", 0)),
+                "size_bytes": int(file_data.get("size", 0)),
+                "download_url": file_data.get('dlink', ''),
+                "direct_download_url": direct_link,
+                "is_directory": file_data.get("isdir", 0) == 1 or file_data.get("isdir", "0") == "1",
+                "modify_time": file_data.get("server_mtime", 0),
+                "thumbnails": file_data.get("thumbs", {}),
+                "path": file_data.get("path", ""),
+                "category": file_data.get("category", 0)
+            }
+            
+            results.append(result)
+            
+            # Add delay between processing
+            if i < min(len(files), 5) - 1:
+                time.sleep(random.uniform(0.5, 1.5))
+                
+        except Exception as e:
+            logger.error(f"Error processing file {file_data.get('server_filename', 'unknown')}: {str(e)}")
+            continue
+    
+    return results
 
 @app.route('/api', methods=['GET'])
 def api_handler():
@@ -370,11 +453,11 @@ def api_handler():
                 "usage": "/api?url=YOUR_TERABOX_SHARE_URL"
             }), 400
         
-        logger.info(f"Processing URL: {url}")
+        logger.info(f"API request for URL: {url}")
         
-        # Run async function in thread pool
-        future = executor.submit(run_async_function, fetch_download_link_async, url)
-        files = future.result(timeout=60)  # 60 second timeout
+        # Run in thread pool to avoid blocking
+        future = executor.submit(fetch_download_links, url)
+        files = future.result(timeout=60)
         
         if not files:
             return jsonify({
@@ -384,48 +467,9 @@ def api_handler():
             }), 404
         
         # Process files
-        async def process_all_files():
-            cookies = load_cookies()
-            cookie_jar = aiohttp.CookieJar()
-            for name, value in cookies.items():
-                cookie_jar.update_cookies({name: value})
-            
-            # Configure connector properly
-            connector = aiohttp.TCPConnector(
-                limit=30,
-                limit_per_host=5,
-                keepalive_timeout=30,
-                enable_cleanup_closed=True,
-                force_close=False,
-                ssl=False
-            )
-            
-            timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT, connect=10)
-                
-            async with aiohttp.ClientSession(
-                cookie_jar=cookie_jar,
-                connector=connector,
-                timeout=timeout,
-                headers=get_random_headers()
-            ) as session:
-                results = []
-                
-                # Process files sequentially to avoid overwhelming the server
-                for file in files[:10]:  # Limit to first 10 files
-                    try:
-                        processed = await process_file(session, file)
-                        if processed:
-                            results.append(processed)
-                        # Add delay between file processing
-                        await asyncio.sleep(0.5)
-                    except Exception as e:
-                        logger.error(f"Error processing file {file.get('server_filename', 'unknown')}: {str(e)}")
-                        continue
-                
-                return results
-        
-        future = executor.submit(run_async_function, process_all_files)
-        results = future.result(timeout=90)  # 90 second timeout
+        cookies = load_cookies()
+        future = executor.submit(process_files, files, cookies)
+        results = future.result(timeout=90)
         
         if not results:
             return jsonify({
@@ -440,6 +484,7 @@ def api_handler():
             "files": results,
             "processing_time": f"{time.time() - start_time:.2f} seconds",
             "file_count": len(results),
+            "total_files": len(files),
             "developer": "@Farooq_is_king",
             "channel": "@OPLEECH_WD"
         })
@@ -460,7 +505,7 @@ def home():
         "status": "Running ✅",
         "developer": "@Farooq_is_king",
         "channel": "@Opleech_WD",
-        "version": "2.0.0",
+        "version": "3.0.0",
         "endpoints": {
             "/api": "GET with ?url=TERABOX_SHARE_URL parameter",
             "/health": "Service health check"
@@ -502,6 +547,10 @@ def internal_error(error):
         "status": "error",
         "message": "Internal server error"
     }), 500
+
+# Disable SSL warnings
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 if __name__ == '__main__':
     # Ensure cookies file exists
