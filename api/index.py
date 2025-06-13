@@ -363,25 +363,99 @@ def fetch_download_links(url):
         raise
 
 def get_direct_link(dlink, cookies):
-    """Get direct download link"""
+    """Get direct download link by following redirects properly"""
     try:
         if not dlink:
             return ""
         
+        logger.info(f"Getting direct link for: {dlink[:50]}...")
+        
+        # Create session with proper headers
+        session = requests.Session()
+        session.cookies.update(cookies)
+        
         headers = get_random_headers()
-        headers['Referer'] = 'https://www.terabox.com/'
+        headers.update({
+            'Referer': 'https://www.terabox.com/',
+            'Accept': '*/*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache'
+        })
         
-        response = make_request(
-            dlink,
-            headers=headers,
-            cookies=cookies,
-            allow_redirects=False,
-            timeout=15
-        )
+        # Follow redirects manually to get the final URL
+        current_url = dlink
+        redirect_count = 0
+        max_redirects = 10
         
-        if 300 <= response.status_code < 400 and 'Location' in response.headers:
-            return response.headers['Location']
+        while redirect_count < max_redirects:
+            try:
+                response = session.get(
+                    current_url,
+                    headers=headers,
+                    allow_redirects=False,
+                    timeout=15,
+                    verify=False
+                )
+                
+                # Check for redirect
+                if 300 <= response.status_code < 400:
+                    if 'Location' in response.headers:
+                        current_url = response.headers['Location']
+                        redirect_count += 1
+                        
+                        # Check if this is a direct download URL
+                        if any(domain in current_url for domain in ['d.1024tera.com', 'nfile.1024tera.com', 'd2.terabox.com', 'd3.terabox.com']):
+                            logger.info(f"Found direct download URL after {redirect_count} redirects")
+                            session.close()
+                            return current_url
+                        
+                        # Small delay between redirects
+                        time.sleep(0.5)
+                        continue
+                    else:
+                        break
+                elif response.status_code == 200:
+                    # Check if current URL is already a direct download URL
+                    if any(domain in current_url for domain in ['d.1024tera.com', 'nfile.1024tera.com', 'd2.terabox.com', 'd3.terabox.com']):
+                        logger.info("URL is already a direct download link")
+                        session.close()
+                        return current_url
+                    else:
+                        # Try to extract download URL from response
+                        content = response.text
+                        
+                        # Look for download URLs in the response content
+                        download_patterns = [
+                            r'"(https?://[^"]*(?:d\.1024tera\.com|nfile\.1024tera\.com|d2\.terabox\.com|d3\.terabox\.com)[^"]*)"',
+                            r"'(https?://[^']*(?:d\.1024tera\.com|nfile\.1024tera\.com|d2\.terabox\.com|d3\.terabox\.com)[^']*)'",
+                            r'href="([^"]*(?:d\.1024tera\.com|nfile\.1024tera\.com|d2\.terabox\.com|d3\.terabox\.com)[^"]*)"'
+                        ]
+                        
+                        for pattern in download_patterns:
+                            matches = re.findall(pattern, content)
+                            if matches:
+                                direct_url = matches[0]
+                                logger.info("Found direct download URL in response content")
+                                session.close()
+                                return direct_url
+                        
+                        break
+                else:
+                    logger.warning(f"Unexpected status code: {response.status_code}")
+                    break
+                    
+            except requests.exceptions.Timeout:
+                logger.warning("Timeout while getting direct link")
+                break
+            except Exception as e:
+                logger.warning(f"Error during redirect: {str(e)}")
+                break
         
+        session.close()
+        
+        # If we couldn't get a direct link, return the original dlink
+        logger.warning("Could not resolve to direct download URL, returning original dlink")
         return dlink
         
     except Exception as e:
@@ -411,26 +485,29 @@ def process_files(files, cookies):
             logger.info(f"Processing file {i+1}/{min(len(files), 5)}: {file_data.get('server_filename', 'Unknown')}")
             
             # Get direct link
-            direct_link = get_direct_link(file_data.get('dlink', ''), cookies)
+            dlink = file_data.get('dlink', '')
+            direct_link = get_direct_link(dlink, cookies) if dlink else ""
             
             result = {
                 "file_name": file_data.get("server_filename", "Unknown"),
                 "size": format_size(file_data.get("size", 0)),
                 "size_bytes": int(file_data.get("size", 0)),
-                "download_url": file_data.get('dlink', ''),
+                "download_url": dlink,
                 "direct_download_url": direct_link,
                 "is_directory": file_data.get("isdir", 0) == 1 or file_data.get("isdir", "0") == "1",
                 "modify_time": file_data.get("server_mtime", 0),
-                "thumbnails": file_data.get("thumbs", {}),
+                "thumbnails": file_data.get("thumbs", {}) if file_data.get("thumbs") else {},
                 "path": file_data.get("path", ""),
-                "category": file_data.get("category", 0)
+                "category": file_data.get("category", 0),
+                "fs_id": file_data.get("fs_id", ""),
+                "md5": file_data.get("md5", "")
             }
             
             results.append(result)
             
             # Add delay between processing
             if i < min(len(files), 5) - 1:
-                time.sleep(random.uniform(0.5, 1.5))
+                time.sleep(random.uniform(1, 2))
                 
         except Exception as e:
             logger.error(f"Error processing file {file_data.get('server_filename', 'unknown')}: {str(e)}")
@@ -469,7 +546,7 @@ def api_handler():
         # Process files
         cookies = load_cookies()
         future = executor.submit(process_files, files, cookies)
-        results = future.result(timeout=90)
+        results = future.result(timeout=120)  # Increased timeout for processing
         
         if not results:
             return jsonify({
@@ -505,12 +582,13 @@ def home():
         "status": "Running ✅",
         "developer": "@Farooq_is_king",
         "channel": "@Opleech_WD",
-        "version": "3.0.0",
+        "version": "3.1.0",
         "endpoints": {
             "/api": "GET with ?url=TERABOX_SHARE_URL parameter",
             "/health": "Service health check"
         },
-        "usage_example": "/api?url=https://terabox.com/s/1xxxxxxxxxxxxxxx"
+        "usage_example": "/api?url=https://terabox.com/s/1xxxxxxxxxxxxxxx",
+        "note": "Fixed direct download link resolution"
     }
     return Response(
         json.dumps(data, ensure_ascii=False, indent=2), 
